@@ -1,3 +1,3 @@
-"""Free Claude Gateway – real multi-provider AI gateway with budgets and cost tracking."""
+"""Free Claude Gateway – multi-provider AI gateway with budgets, cost tracking and admin UI."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
