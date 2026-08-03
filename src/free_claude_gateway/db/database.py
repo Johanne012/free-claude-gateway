@@ -28,6 +28,19 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        try:
+            cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(api_keys)").fetchall()]
+            if "max_spend_per_day_usd" not in cols:
+                conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN max_spend_per_day_usd REAL DEFAULT 0.0")
+            if "max_spend_per_month_usd" not in cols:
+                conn.exec_driver_sql("ALTER TABLE api_keys ADD COLUMN max_spend_per_month_usd REAL DEFAULT 0.0")
+            cols_logs = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(request_logs)").fetchall()]
+            if "cost_usd" not in cols_logs:
+                conn.exec_driver_sql("ALTER TABLE request_logs ADD COLUMN cost_usd REAL DEFAULT 0.0")
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Migration note: {e}")
     logger.info(f"Database ready at {DB_PATH}")
 
     with SessionLocal() as session:
