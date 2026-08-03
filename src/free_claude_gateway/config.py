@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from free_claude_gateway.core.balancer import parse_weighted_chain
+
+BalanceStrategy = Literal["priority", "round_robin", "random", "weighted"]
 
 
 class Settings(BaseSettings):
@@ -18,12 +22,23 @@ class Settings(BaseSettings):
     port: int = 8082
     auth_token: Optional[str] = "fcc"
 
-    # Routing
+    # Routing – primary models per Claude tier
     model_opus: str = "openrouter/deepseek/deepseek-chat:free"
     model_sonnet: str = "openrouter/deepseek/deepseek-chat:free"
     model_haiku: str = "ollama/llama3.2"
     model_fallback: str = "nvidia_nim/nvidia/nemotron"
-    fallback_chain: str = "openrouter/deepseek/deepseek-chat:free,deepseek/deepseek-chat,ollama/llama3.2"
+
+    # Balancing strategy: priority | round_robin | random | weighted
+    balance_strategy: BalanceStrategy = "priority"
+
+    # Fallback / balance chain
+    # For weighted: append :weight  e.g. openrouter/xxx:3,deepseek/yyy:2
+    fallback_chain: str = (
+        "openrouter/deepseek/deepseek-chat:free,"
+        "deepseek/deepseek-chat,"
+        "kimi/kimi-k2.5,"
+        "ollama/llama3.2"
+    )
 
     # Provider keys
     nvidia_nim_api_key: Optional[str] = None
@@ -37,7 +52,12 @@ class Settings(BaseSettings):
     lmstudio_base_url: str = "http://localhost:1234"
 
     def get_fallback_list(self) -> list[str]:
-        return [m.strip() for m in self.fallback_chain.split(",") if m.strip()]
+        candidates, _ = parse_weighted_chain(self.fallback_chain)
+        return candidates
+
+    def get_weights(self) -> dict[str, int]:
+        _, weights = parse_weighted_chain(self.fallback_chain)
+        return weights
 
 
 @lru_cache
