@@ -1,3 +1,3 @@
-"""Free Claude Gateway – improved multi-provider proxy for coding agents."""
+"""Free Claude Gateway – real multi-provider AI gateway with database."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
