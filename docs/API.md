@@ -1,157 +1,110 @@
 # Free Claude Gateway – API Documentation
 
-**Version:** 0.2.0  
+**Version:** 0.3.0  
 **Base URL (default):** `http://127.0.0.1:8082`
 
-The gateway exposes an **Anthropic Messages API compatible** interface so Claude Code and similar clients can use it without modification.
+Anthropic Messages API compatible gateway with real users, API keys, budgets and cost tracking.
 
-Interactive docs (Swagger): `/docs`  
-ReDoc: `/redoc`
+Interactive docs: `/docs` · ReDoc: `/redoc`
 
 ---
 
 ## Authentication
 
-All protected endpoints accept one of:
-
 | Header | Example |
-|--------|---------|
-| `Authorization: Bearer <key>` | `Authorization: Bearer fcc_xxxxxxxxxxxx` |
-| `x-api-key: <key>` | `x-api-key: fcc_xxxxxxxxxxxx` |
+|--------|--------|
+| `Authorization: Bearer <key>` | `Bearer fcc_xxxxxxxxxxxx` |
+| `x-api-key: <key>` | `fcc_xxxxxxxxxxxx` |
 
-- Real API keys are stored in the database (created on first run for the `admin` user).
-- For backward compatibility, the value of `AUTH_TOKEN` from `.env` is still accepted.
+Keys are stored hashed in SQLite. A default `admin` key is printed on first start.
 
 ---
 
 ## Endpoints
 
-### 1. Health Check
+### Health
 
 ```http
 GET /health
 ```
+No auth. Returns `{ "status": "ok", "version": "0.3.0" }`.
 
-**Auth:** Not required
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "version": "0.2.0"
-}
-```
-
----
-
-### 2. Root / Info
-
-```http
-GET /
-```
-
-**Auth:** Not required
-
----
-
-### 3. List Models
+### List Models
 
 ```http
 GET /v1/models
 ```
+Auth required. Returns configured Opus/Sonnet/Haiku + fallback models.
 
-**Auth:** Required
-
-Returns the models configured for Opus / Sonnet / Haiku tiers plus the fallback chain.  
-This endpoint enables Claude Code native `/model` picker.
-
----
-
-### 4. Create Message (Core Endpoint)
+### Create Message (core)
 
 ```http
 POST /v1/messages
 ```
+Auth required. Anthropic-compatible body (`model`, `messages`, `max_tokens`, `stream`, …).
 
-**Auth:** Required  
-**Content-Type:** `application/json`
+**Budget enforcement:** if the key has exceeded daily/monthly spend, requests or tokens limits → **429**.
 
-Main endpoint used by Claude Code. Compatible with the Anthropic Messages API.
+**Cost:** each successful request is priced and stored as `cost_usd` in `request_logs`.
 
-#### Request Body (main fields)
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `model` | string | Yes | Model name (e.g. `claude-sonnet-4` or `provider/model`) |
-| `messages` | array | Yes | Conversation messages |
-| `max_tokens` | integer | No | Default 4096 |
-| `stream` | boolean | No | Default false |
-| `temperature` | number | No | Sampling temperature |
-| `system` | string or array | No | System prompt |
-| `tools` | array | No | Tool definitions |
-
-#### Example
-
-```bash
-curl -X POST http://127.0.0.1:8082/v1/messages \
-  -H "Authorization: Bearer fcc_your_key_here" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4",
-    "max_tokens": 1024,
-    "messages": [
-      {"role": "user", "content": "Hello"}
-    ]
-  }'
-```
-
-#### Streaming
-
-Set `"stream": true` for Server-Sent Events (Anthropic format).
-
-#### Routing Behavior
-
-1. `model` is mapped to configured provider/model (Opus / Sonnet / Haiku / fallback).
-2. Balancer (`BALANCE_STRATEGY`) decides candidate order.
-3. Providers in cooldown (after rate-limit) are skipped.
-4. On failure the next candidate is tried.
-
----
-
-### 5. Usage Statistics
+### Stats
 
 ```http
 GET /stats
 ```
+Auth required.
 
-**Auth:** Required
+```json
+{
+  "memory": { "uptime_seconds": 3600, "total_requests": 42, "providers": {} },
+  "database": {
+    "total_requests": 42,
+    "successful_requests": 40,
+    "total_cost_usd": 0.0123,
+    "total_input_tokens": 15000,
+    "total_output_tokens": 8000
+  },
+  "current_key": {
+    "requests_today": 10,
+    "tokens_today": 5000,
+    "spend_today_usd": 0.004,
+    "spend_month_usd": 0.05
+  }
+}
+```
 
-Returns in-memory counters + persistent database counts.
-
----
-
-### 6. Admin Dashboard
+### Admin
 
 ```http
 GET /admin
 ```
-
-**Auth:** Required  
-**Response:** HTML page
+Auth required. HTML dashboard with config, provider status and total cost.
 
 ---
 
-## Error Responses
+## Budgets (per API key)
+
+| DB column | Meaning |
+|-----------|--------|
+| `max_spend_per_day_usd` | Daily USD cap (0 = unlimited) |
+| `max_spend_per_month_usd` | Monthly USD cap |
+| `max_requests_per_day` | Daily request limit |
+| `max_tokens_per_day` | Daily token limit |
+
+---
+
+## Errors
 
 | Status | Meaning |
-|--------|---------|
-| 400 | Invalid request body |
-| 401 | Missing or invalid API key |
+|--------|--------|
+| 400 | Invalid body |
+| 401 | Missing/invalid key |
+| 429 | Budget exceeded |
 | 502 | All providers failed |
 
 ---
 
-## Using with Claude Code
+## Claude Code
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8082"
@@ -159,17 +112,3 @@ export ANTHROPIC_AUTH_TOKEN="fcc_your_real_key"
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
 claude
 ```
-
-Or:
-
-```bash
-FCC_API_KEY="fcc_your_real_key" uv run fcc-claude
-```
-
----
-
-## Notes
-
-- All requests are logged in SQLite (`request_logs` table).
-- Rate-limited providers get a 60-second cooldown.
-- Interactive OpenAPI docs available at `/docs` when the server is running.
