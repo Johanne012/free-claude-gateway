@@ -1,0 +1,10 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8082:8082"
+    env_file:
+      - .env
+    restart: unless-stopped
