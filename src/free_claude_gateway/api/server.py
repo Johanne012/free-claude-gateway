@@ -7,13 +7,16 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from loguru import logger
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from free_claude_gateway import __version__
 from free_claude_gateway.config import Settings, get_settings
 from free_claude_gateway.core.balancer import ProviderBalancer
 from free_claude_gateway.core.models import AnthropicRequest, ModelInfo
+from free_claude_gateway.core.pricing import calc_cost_usd
 from free_claude_gateway.core.stats import stats
+from free_claude_gateway.db.budgets import check_budget, get_key_usage
 from free_claude_gateway.db.database import SessionLocal, authenticate_api_key, init_db
 from free_claude_gateway.db.models import ApiKey, RequestLog
 from free_claude_gateway.providers.registry import build_providers, parse_model_ref
@@ -21,7 +24,7 @@ from free_claude_gateway.providers.registry import build_providers, parse_model_
 app = FastAPI(
     title="Free Claude Gateway",
     version=__version__,
-    description="Real multi-provider AI gateway with users, API keys and usage database",
+    description="Real multi-provider AI gateway with users, API keys, budgets and cost tracking",
 )
 
 _balancer = ProviderBalancer(strategy="priority")
@@ -105,7 +108,8 @@ def _log_request(
     output_tokens: int = 0,
     latency_ms: float | None = None,
     error: str | None = None,
-) -> None:
+) -> float:
+    cost = calc_cost_usd(model, input_tokens, output_tokens) if success else 0.0
     log = RequestLog(
         user_id=api_key.user_id if api_key else None,
         api_key_id=api_key.id if api_key else None,
@@ -115,11 +119,13 @@ def _log_request(
         is_stream=is_stream,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cost_usd=cost,
         latency_ms=latency_ms,
         error_message=error[:500] if error else None,
     )
     db.add(log)
     db.commit()
+    return cost
 
 
 @app.get("/health")
@@ -135,9 +141,20 @@ async def get_stats(
     mem = stats.get_snapshot()
     total_db = db.query(RequestLog).count()
     success_db = db.query(RequestLog).filter(RequestLog.success == True).count()  # noqa: E712
+    total_cost = db.query(func.coalesce(func.sum(RequestLog.cost_usd), 0.0)).scalar() or 0.0
+    total_in = db.query(func.coalesce(func.sum(RequestLog.input_tokens), 0)).scalar() or 0
+    total_out = db.query(func.coalesce(func.sum(RequestLog.output_tokens), 0)).scalar() or 0
+    key_usage = get_key_usage(db, api_key.id) if api_key else None
     return {
         "memory": mem,
-        "database": {"total_requests": total_db, "successful_requests": success_db},
+        "database": {
+            "total_requests": total_db,
+            "successful_requests": success_db,
+            "total_cost_usd": round(float(total_cost), 6),
+            "total_input_tokens": int(total_in),
+            "total_output_tokens": int(total_out),
+        },
+        "current_key": key_usage,
     }
 
 
@@ -172,6 +189,10 @@ async def create_message(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
 
+    budget_err = check_budget(db, api_key)
+    if budget_err:
+        raise HTTPException(status_code=429, detail=budget_err)
+
     target_ref = resolve_model(anth_req.model, settings)
     providers = build_providers(settings)
     base_candidates = [target_ref] + [m for m in settings.get_fallback_list() if m != target_ref]
@@ -197,22 +218,31 @@ async def create_message(
             if anth_req.stream:
                 generator = provider.stream(anth_req, model_id)
                 stats.record_success(provider_name)
-                _log_request(db, api_key, provider_name, model_id, True, True, latency_ms=(time.time()-start_ts)*1000)
-                return StreamingResponse(generator, media_type="text/event-stream",
-                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+                _log_request(db, api_key, provider_name, model_id, True, True,
+                             latency_ms=(time.time() - start_ts) * 1000)
+                return StreamingResponse(
+                    generator,
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+                )
             else:
                 result = await provider.chat(anth_req, model_id)
                 usage = result.get("usage", {})
-                stats.record_success(provider_name, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-                _log_request(db, api_key, provider_name, model_id, True, False,
-                             usage.get("input_tokens", 0), usage.get("output_tokens", 0),
-                             (time.time()-start_ts)*1000)
+                in_tok = usage.get("input_tokens", 0)
+                out_tok = usage.get("output_tokens", 0)
+                stats.record_success(provider_name, in_tok, out_tok)
+                _log_request(
+                    db, api_key, provider_name, model_id, True, False,
+                    in_tok, out_tok, (time.time() - start_ts) * 1000,
+                )
                 return JSONResponse(content=result)
         except Exception as e:
             is_rl = _is_rate_limit_error(e)
             stats.record_failure(provider_name, str(e), is_rate_limit=is_rl)
-            _log_request(db, api_key, provider_name, model_id, False, anth_req.stream, error=str(e),
-                         latency_ms=(time.time()-start_ts)*1000)
+            _log_request(
+                db, api_key, provider_name, model_id, False, anth_req.stream,
+                error=str(e), latency_ms=(time.time() - start_ts) * 1000,
+            )
             last_error = e
             continue
 
@@ -228,13 +258,19 @@ async def admin_page(
     snap = stats.get_snapshot()
     providers = build_providers(settings)
     total_logs = db.query(RequestLog).count()
+    total_cost = db.query(func.coalesce(func.sum(RequestLog.cost_usd), 0.0)).scalar() or 0.0
     rows = ""
     for name, p in providers.items():
         available = p.is_available()
         pstats = snap["providers"].get(name, {})
         cooldown = pstats.get("in_cooldown", False)
         status = "Ready" if available and not cooldown else ("Cooldown" if cooldown else "No key")
-        rows += f"<tr><td><b>{name}</b></td><td>{status}</td><td>{pstats.get('requests',0)}</td><td>{pstats.get('successes',0)}</td><td>{pstats.get('failures',0)}</td><td>{pstats.get('rate_limits',0)}</td><td>{pstats.get('input_tokens',0)}/{pstats.get('output_tokens',0)}</td></tr>"
+        rows += (
+            f"<tr><td><b>{name}</b></td><td>{status}</td>"
+            f"<td>{pstats.get('requests', 0)}</td><td>{pstats.get('successes', 0)}</td>"
+            f"<td>{pstats.get('failures', 0)}</td><td>{pstats.get('rate_limits', 0)}</td>"
+            f"<td>{pstats.get('input_tokens', 0)}/{pstats.get('output_tokens', 0)}</td></tr>"
+        )
 
     html = f"""<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Free Claude Gateway</title>
 <style>body{{font-family:system-ui;max-width:960px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e1e4e8}}
@@ -242,7 +278,7 @@ h1{{color:#58a6ff}}table{{width:100%;border-collapse:collapse}}th,td{{padding:.6
 th{{background:#161b22;color:#8b949e}}.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.2rem;margin-bottom:1.5rem}}
 .muted{{color:#8b949e;font-size:.9rem}}</style></head><body>
 <h1>Free Claude Gateway</h1>
-<p class=\"muted\">v{__version__} · DB requests: {total_logs} · Memory: {snap['total_requests']}</p>
+<p class=\"muted\">v{__version__} · DB requests: {total_logs} · Total cost: ${float(total_cost):.4f}</p>
 <div class=\"card\"><h3>Config</h3>
 <p><b>Strategy:</b> {settings.balance_strategy}</p>
 <p><b>Opus:</b> {settings.model_opus}</p>
@@ -256,4 +292,11 @@ th{{background:#161b22;color:#8b949e}}.card{{background:#161b22;border:1px solid
 
 @app.get("/")
 async def root():
-    return {"name": "Free Claude Gateway", "version": __version__, "docs": "/docs", "admin": "/admin", "stats": "/stats", "health": "/health"}
+    return {
+        "name": "Free Claude Gateway",
+        "version": __version__,
+        "docs": "/docs",
+        "admin": "/admin",
+        "stats": "/stats",
+        "health": "/health",
+    }
