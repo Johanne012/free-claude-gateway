@@ -36,8 +36,11 @@ class ApiKey(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     max_requests_per_day: Mapped[int] = mapped_column(Integer, default=0)
     max_tokens_per_day: Mapped[int] = mapped_column(Integer, default=0)
+    max_spend_per_day_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    max_spend_per_month_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
     user: Mapped["User"] = relationship(back_populates="api_keys")
     logs: Mapped[list["RequestLog"]] = relationship(back_populates="api_key")
@@ -49,14 +52,18 @@ class RequestLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     api_key_id: Mapped[Optional[int]] = mapped_column(ForeignKey("api_keys.id"), nullable=True, index=True)
+
     provider: Mapped[str] = mapped_column(String(64), index=True)
     model: Mapped[str] = mapped_column(String(128))
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     is_stream: Mapped[bool] = mapped_column(Boolean, default=False)
+
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     latency_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
     user: Mapped[Optional["User"]] = relationship(back_populates="logs")
