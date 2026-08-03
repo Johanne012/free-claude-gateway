@@ -8,6 +8,7 @@ from loguru import logger
 
 from free_claude_gateway import __version__
 from free_claude_gateway.config import Settings, get_settings
+from free_claude_gateway.core.balancer import ProviderBalancer
 from free_claude_gateway.core.models import AnthropicRequest, ModelInfo
 from free_claude_gateway.providers.registry import build_providers, parse_model_ref
 
@@ -16,6 +17,16 @@ app = FastAPI(
     version=__version__,
     description="Improved multi-provider proxy for Claude Code and coding agents",
 )
+
+# Global balancer instance (keeps round-robin state across requests)
+_balancer = ProviderBalancer(strategy="priority")
+
+
+def get_balancer(settings: Settings = Depends(get_settings)) -> ProviderBalancer:
+    global _balancer
+    if _balancer.strategy != settings.balance_strategy:
+        _balancer = ProviderBalancer(strategy=settings.balance_strategy)
+    return _balancer
 
 
 def verify_auth(
@@ -75,6 +86,7 @@ async def list_models(
 async def create_message(
     request: Request,
     settings: Settings = Depends(get_settings),
+    balancer: ProviderBalancer = Depends(get_balancer),
     _: None = Depends(verify_auth),
 ):
     body = await request.json()
@@ -86,11 +98,22 @@ async def create_message(
     target_ref = resolve_model(anth_req.model, settings)
     providers = build_providers(settings)
 
-    candidates = [target_ref] + [m for m in settings.get_fallback_list() if m != target_ref]
+    # Build base candidate list: primary + the configured chain
+    base_candidates = [target_ref] + [
+        m for m in settings.get_fallback_list() if m != target_ref
+    ]
+
+    # Apply balancing strategy → ordered list to try
+    ordered = balancer.select(
+        candidates=base_candidates,
+        weights=settings.get_weights() if settings.balance_strategy == "weighted" else None,
+    )
+
+    logger.info(f"Strategy={settings.balance_strategy} | order: {ordered}")
 
     last_error: Exception | None = None
 
-    for ref in candidates:
+    for ref in ordered:
         provider_name, model_id = parse_model_ref(ref)
         provider = providers.get(provider_name)
         if not provider or not provider.is_available():
