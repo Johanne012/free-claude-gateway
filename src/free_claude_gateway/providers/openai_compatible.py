@@ -122,48 +122,95 @@ class OpenAICompatibleProvider(BaseProvider):
             return _openai_to_anthropic_response(data, model)
 
     async def stream(self, request: AnthropicRequest, model: str) -> AsyncIterator[str]:
-        payload = {
+        """Stream with best-effort usage in final message_delta for cost tracking."""
+        messages = _anthropic_to_openai_messages(request)
+        payload: dict[str, Any] = {
             "model": model,
-            "messages": _anthropic_to_openai_messages(request),
+            "messages": messages,
             "max_tokens": request.max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if request.temperature is not None:
             payload["temperature"] = request.temperature
 
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        approx_input = max(1, len(json.dumps(messages)) // 4)
+        output_chars = 0
+        input_tokens = 0
+        output_tokens = 0
 
         yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model, 'content': [], 'stop_reason': None}})}\n\n"
         yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
 
         async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream("POST", url, json=payload, headers=self._headers()) as resp:
-                if resp.status_code >= 400:
-                    text = await resp.aread()
-                    logger.error(f"[{self.name}] stream error {resp.status_code}: {text[:500]}")
-                    resp.raise_for_status()
+            # First try with stream_options; some providers reject it
+            resp_ctx = client.stream("POST", url, json=payload, headers=self._headers())
+            async with resp_ctx as resp:
+                if resp.status_code == 400:
+                    payload.pop("stream_options", None)
+                    async with client.stream("POST", url, json=payload, headers=self._headers()) as resp2:
+                        if resp2.status_code >= 400:
+                            err = await resp2.aread()
+                            logger.error(f"[{self.name}] stream error {resp2.status_code}: {err[:500]}")
+                            resp2.raise_for_status()
+                        async for line in resp2.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                usage = chunk.get("usage") or {}
+                                if usage:
+                                    input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or input_tokens
+                                    output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or output_tokens
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content")
+                                if content:
+                                    output_chars += len(content)
+                                    event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": content}}
+                                    yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
+                            except json.JSONDecodeError:
+                                continue
+                else:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        logger.error(f"[{self.name}] stream error {resp.status_code}: {err[:500]}")
+                        resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            usage = chunk.get("usage") or {}
+                            if usage:
+                                input_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or input_tokens
+                                output_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or output_tokens
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content")
+                            if content:
+                                output_chars += len(content)
+                                event = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": content}}
+                                yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
+                        except json.JSONDecodeError:
+                            continue
 
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content")
-                        if content:
-                            event = {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": content},
-                            }
-                            yield f"event: content_block_delta\ndata: {json.dumps(event)}\n\n"
-                    except json.JSONDecodeError:
-                        continue
+        if not input_tokens:
+            input_tokens = approx_input
+        if not output_tokens:
+            output_tokens = max(1, output_chars // 4) if output_chars else 0
 
         yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 0}})}\n\n"
+        usage_payload = {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        }
+        yield f"event: message_delta\ndata: {json.dumps(usage_payload)}\n\n"
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
