@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 from typing import Optional
@@ -11,6 +12,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from free_claude_gateway import __version__
+from free_claude_gateway.api.admin_api import router as admin_router
 from free_claude_gateway.config import Settings, get_settings
 from free_claude_gateway.core.balancer import ProviderBalancer
 from free_claude_gateway.core.models import AnthropicRequest, ModelInfo
@@ -28,6 +30,7 @@ app = FastAPI(
 )
 
 _balancer = ProviderBalancer(strategy="priority")
+app.include_router(admin_router)
 
 
 @app.on_event("startup")
@@ -214,14 +217,32 @@ async def create_message(
             continue
 
         try:
-            logger.info(f"Routing → {provider_name}/{model_id} (stream={anth_req.stream})")
+            logger.info(f"Routing -> {provider_name}/{model_id} (stream={anth_req.stream})")
             if anth_req.stream:
-                generator = provider.stream(anth_req, model_id)
-                stats.record_success(provider_name)
-                _log_request(db, api_key, provider_name, model_id, True, True,
-                             latency_ms=(time.time() - start_ts) * 1000)
+                async def stream_and_log():
+                    in_tok, out_tok = 0, 0
+                    try:
+                        async for chunk in provider.stream(anth_req, model_id):
+                            if "message_delta" in chunk and "usage" in chunk:
+                                try:
+                                    for part in chunk.split("\n"):
+                                        if part.startswith("data: "):
+                                            payload = json.loads(part[6:])
+                                            u = payload.get("usage") or {}
+                                            in_tok = u.get("input_tokens", in_tok) or in_tok
+                                            out_tok = u.get("output_tokens", out_tok) or out_tok
+                                except Exception:
+                                    pass
+                            yield chunk
+                    finally:
+                        stats.record_success(provider_name, in_tok, out_tok)
+                        _log_request(
+                            db, api_key, provider_name, model_id, True, True,
+                            in_tok, out_tok, (time.time() - start_ts) * 1000,
+                        )
+
                 return StreamingResponse(
-                    generator,
+                    stream_and_log(),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
                 )
@@ -272,31 +293,56 @@ async def admin_page(
             f"<td>{pstats.get('input_tokens', 0)}/{pstats.get('output_tokens', 0)}</td></tr>"
         )
 
-    html = f"""<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Free Claude Gateway</title>
-<style>body{{font-family:system-ui;max-width:960px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e1e4e8}}
-h1{{color:#58a6ff}}table{{width:100%;border-collapse:collapse}}th,td{{padding:.6rem;border-bottom:1px solid #30363d}}
-th{{background:#161b22;color:#8b949e}}.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.2rem;margin-bottom:1.5rem}}
-.muted{{color:#8b949e;font-size:.9rem}}</style></head><body>
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><title>Free Claude Gateway Admin</title>
+<style>
+body{{font-family:system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e1e4e8}}
+h1,h2{{color:#58a6ff}}table{{width:100%;border-collapse:collapse;margin-top:.8rem}}
+th,td{{padding:.5rem .7rem;border-bottom:1px solid #30363d;font-size:.9rem}}
+th{{background:#161b22;color:#8b949e}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.2rem;margin-bottom:1.2rem}}
+.muted{{color:#8b949e;font-size:.9rem}}button{{background:#238636;color:#fff;border:none;border-radius:6px;padding:.4rem .8rem;cursor:pointer}}
+button.danger{{background:#da3633}}button.secondary{{background:#21262d;border:1px solid #30363d}}
+input{{background:#0d1117;border:1px solid #30363d;color:#e1e4e8;border-radius:6px;padding:.35rem .55rem;margin:.2rem}}
+label{{display:inline-block;min-width:130px;color:#8b949e;font-size:.85rem}}code{{background:#0d1117;padding:.1rem .35rem;border-radius:4px}}
+</style></head><body>
 <h1>Free Claude Gateway</h1>
-<p class=\"muted\">v{__version__} · DB requests: {total_logs} · Total cost: ${float(total_cost):.4f}</p>
-<div class=\"card\"><h3>Config</h3>
+<p class=\"muted\">v{__version__} · DB: {total_logs} requests · Cost: ${float(total_cost):.4f}</p>
+<div class=\"card\"><h2>Config</h2>
 <p><b>Strategy:</b> {settings.balance_strategy}</p>
 <p><b>Opus:</b> {settings.model_opus}</p>
 <p><b>Sonnet:</b> {settings.model_sonnet}</p>
 <p><b>Haiku:</b> {settings.model_haiku}</p></div>
-<div class=\"card\"><h3>Providers</h3>
+<div class=\"card\"><h2>Providers</h2>
 <table><thead><tr><th>Provider</th><th>Status</th><th>Req</th><th>OK</th><th>Fail</th><th>RL</th><th>Tokens</th></tr></thead>
-<tbody>{rows}</tbody></table></div></body></html>"""
+<tbody>{rows}</tbody></table></div>
+<div class=\"card\"><h2>API Keys & Budgets</h2>
+<div id=\"keys-table\">Loading...</div>
+<hr style=\"border-color:#30363d\">
+<h3>Create new key</h3>
+<div><label>Name</label><input id=\"k-name\" value=\"default\"></div>
+<div><label>Max req/day</label><input id=\"k-req\" type=\"number\" value=\"0\"></div>
+<div><label>Max tokens/day</label><input id=\"k-tok\" type=\"number\" value=\"0\"></div>
+<div><label>Max $/day</label><input id=\"k-day\" type=\"number\" step=\"0.01\" value=\"0\"></div>
+<div><label>Max $/month</label><input id=\"k-month\" type=\"number\" step=\"0.01\" value=\"0\"></div>
+<button onclick=\"createKey()\">Create key</button>
+<pre id=\"new-key-box\" class=\"muted\"></pre></div>
+<script>
+const authHeaders=()=>{{const h={{\"Content-Type\":\"application/json\"}};const k=localStorage.getItem(\"fcc_admin_key\");if(k)h[\"Authorization\"]=\"Bearer \"+k;return h}};
+async function loadKeys(){{
+ try{{const r=await fetch(\"/admin/api/keys\",{{headers:authHeaders()}});
+ if(r.status===401){{const k=prompt(\"Enter admin API key (fcc_...)\");if(k){{localStorage.setItem(\"fcc_admin_key\",k);return loadKeys()}}document.getElementById(\"keys-table\").textContent=\"Auth required\";return}}
+ const data=await r.json();let html=`<table><thead><tr><th>ID</th><th>Name</th><th>Prefix</th><th>Active</th><th>Limits</th><th>Today</th><th></th></tr></thead><tbody>`;
+ for(const k of data.keys){{const u=k.usage||{{}};html+=`<tr><td>${{k.id}}</td><td>${{k.name}}</td><td><code>${{k.key_prefix}}…</code></td><td>${{k.is_active?\"yes\":\"no\"}}</td><td>${{k.max_requests_per_day}}/${{k.max_tokens_per_day}}/$${{k.max_spend_per_day_usd}}/$${{k.max_spend_per_month_usd}}</td><td>${{u.requests_today||0}} · $${{(u.spend_today_usd||0).toFixed(4)}}</td><td><button class=\"secondary\" onclick=\"editBudget(${{k.id}})\">Budget</button> ${{k.is_active?`<button class=\"danger\" onclick=\"revokeKey(${{k.id}})\">Revoke</button>`:\"\"}}</td></tr>`}}
+ html+=\"</tbody></table>\";document.getElementById(\"keys-table\").innerHTML=html}}catch(e){{document.getElementById(\"keys-table\").textContent=\"Failed\"}}}}
+async function createKey(){{const body={{name:document.getElementById(\"k-name\").value||\"default\",max_requests_per_day:+document.getElementById(\"k-req\").value||0,max_tokens_per_day:+document.getElementById(\"k-tok\").value||0,max_spend_per_day_usd:+document.getElementById(\"k-day\").value||0,max_spend_per_month_usd:+document.getElementById(\"k-month\").value||0}};const r=await fetch(\"/admin/api/keys\",{{method:\"POST\",headers:authHeaders(),body:JSON.stringify(body)}});const data=await r.json();if(!r.ok){{alert(data.detail||\"Error\");return}}document.getElementById(\"new-key-box\").textContent=\"Save once: \"+data.raw_key;loadKeys()}}
+async function revokeKey(id){{if(!confirm(\"Revoke #\"+id+\"?\"))return;await fetch(\"/admin/api/keys/\"+id,{{method:\"DELETE\",headers:authHeaders()}});loadKeys()}}
+async function editBudget(id){{const day=prompt(\"Max $/day\",\"0\");if(day===null)return;const month=prompt(\"Max $/month\",\"0\");if(month===null)return;const req=prompt(\"Max requests/day\",\"0\");if(req===null)return;await fetch(\"/admin/api/keys/\"+id,{{method:\"PATCH\",headers:authHeaders(),body:JSON.stringify({{max_spend_per_day_usd:+day,max_spend_per_month_usd:+month,max_requests_per_day:+req}})}});loadKeys()}}
+loadKeys();
+</script></body></html>"""
     return HTMLResponse(content=html)
 
 
 @app.get("/")
 async def root():
-    return {
-        "name": "Free Claude Gateway",
-        "version": __version__,
-        "docs": "/docs",
-        "admin": "/admin",
-        "stats": "/stats",
-        "health": "/health",
-    }
+    return {"name": "Free Claude Gateway", "version": __version__, "docs": "/docs", "admin": "/admin", "stats": "/stats", "health": "/health"}
