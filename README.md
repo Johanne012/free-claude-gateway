@@ -1,22 +1,24 @@
 # Free Claude Gateway
 
-**Real multi-provider AI gateway for Claude Code** with users, API keys, usage database, smart balancing and automatic fallbacks.
+**Real multi-provider AI gateway for Claude Code** with users, API keys, budgets, cost tracking, smart balancing and automatic fallbacks.
 
 Route Claude Code (and compatible clients) to free or low-cost providers like DeepSeek, Kimi, NVIDIA NIM, OpenRouter, Ollama, LM Studio, and more — while keeping the original agent experience.
 
 > Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), rebuilt cleaner with a real database foundation.
 
+**Version:** 0.3.0  
 **API Documentation:** [docs/API.md](docs/API.md)  
 **Interactive docs (when running):** http://localhost:8082/docs
 
 ## Why this project?
 
 - **Real database** — SQLite with users, API keys and request logs
+- **Budgets & cost tracking** — per-key daily/monthly spend limits + real USD cost per request
 - **Smart routing & fallbacks** — priority / round-robin / random / weighted + rate-limit cooldown
 - **Free-tier focused** — DeepSeek, Kimi, NVIDIA NIM, OpenRouter free models, local models
 - **Native model picker** — exposes `/v1/models`
 - **Streaming + tool use** preserved
-- **Admin dashboard** + usage stats
+- **Admin dashboard** + usage & cost stats
 
 ## Quick Start
 
@@ -48,11 +50,28 @@ claude
 | GET | `/health` | Health check |
 | GET | `/v1/models` | List available models |
 | POST | `/v1/messages` | Anthropic-compatible chat (core) |
-| GET | `/stats` | Usage statistics |
-| GET | `/admin` | Simple admin dashboard |
+| GET | `/stats` | Usage + cost statistics |
+| GET | `/admin` | Admin dashboard (includes total cost) |
 | GET | `/docs` | Interactive OpenAPI docs |
 
 Full details: **[docs/API.md](docs/API.md)**
+
+## Budgets & Cost Tracking
+
+Every successful request is priced using a built-in model price table and stored as `cost_usd`.
+
+Per API key you can set (in the database):
+
+| Field | Meaning |
+|-------|--------|
+| `max_spend_per_day_usd` | Daily spend cap in USD (0 = unlimited) |
+| `max_spend_per_month_usd` | Monthly spend cap |
+| `max_requests_per_day` | Daily request limit |
+| `max_tokens_per_day` | Daily token limit |
+
+When a limit is hit, the gateway returns **HTTP 429** with a clear message.
+
+`/stats` returns total cost, token counts, and the current key's daily/monthly usage.
 
 ## Supported Providers
 
