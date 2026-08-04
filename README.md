@@ -1,12 +1,16 @@
 # Free Claude Gateway
 
+[![CI](https://github.com/Johanne012/free-claude-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Johanne012/free-claude-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
 **Real multi-provider AI gateway for Claude Code** with users, API keys, budgets, cost tracking, smart balancing and automatic fallbacks.
 
 Route Claude Code (and compatible clients) to free or low-cost providers like DeepSeek, Kimi, NVIDIA NIM, OpenRouter, Ollama, LM Studio, and more — while keeping the original agent experience.
 
 > Inspired by [free-claude-code](https://github.com/Alishahryar1/free-claude-code), rebuilt cleaner with a real database foundation.
 
-**Version:** 0.3.0  
+**Version:** 0.4.0  
 **API Documentation:** [docs/API.md](docs/API.md)  
 **Interactive docs (when running):** http://localhost:8082/docs
 
@@ -43,6 +47,13 @@ export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
 claude
 ```
 
+Or use the helper:
+
+```bash
+export FCC_API_KEY="fcc_your_real_key"
+uv run fcc-claude
+```
+
 ## Main Endpoints
 
 | Method | Path | Description |
@@ -60,7 +71,7 @@ Full details: **[docs/API.md](docs/API.md)**
 
 Every successful request is priced using a built-in model price table and stored as `cost_usd`.
 
-Per API key you can set (in the database):
+Per API key you can set (in the database / admin UI):
 
 | Field | Meaning |
 |-------|--------|
@@ -91,6 +102,24 @@ See `.env.example` for:
 - Per-tier models (`MODEL_OPUS`, `MODEL_SONNET`, `MODEL_HAIKU`)
 - Balancing strategy (`priority` / `round_robin` / `random` / `weighted`)
 - Fallback chain
+
+## Docker
+
+```bash
+cp .env.example .env
+# fill keys
+docker compose up --build
+```
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+uv run ruff check src tests
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
 ## License
 

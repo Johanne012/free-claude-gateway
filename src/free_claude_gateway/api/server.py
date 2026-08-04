@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -23,19 +24,22 @@ from free_claude_gateway.db.database import SessionLocal, authenticate_api_key, 
 from free_claude_gateway.db.models import ApiKey, RequestLog
 from free_claude_gateway.providers.registry import build_providers, parse_model_ref
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info(f"Free Claude Gateway v{__version__} ready")
+    yield
+
+
 app = FastAPI(
     title="Free Claude Gateway",
     version=__version__,
     description="Real multi-provider AI gateway with users, API keys, budgets and cost tracking",
+    lifespan=lifespan,
 )
 
-_balancer = ProviderBalancer(strategy="priority")
 app.include_router(admin_router)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
 
 
 def get_db():
@@ -47,10 +51,9 @@ def get_db():
 
 
 def get_balancer(settings: Settings = Depends(get_settings)) -> ProviderBalancer:
-    global _balancer
-    if _balancer.strategy != settings.balance_strategy:
-        _balancer = ProviderBalancer(strategy=settings.balance_strategy)
-    return _balancer
+    # Create a fresh balancer per request based on current settings.
+    # Avoids mutable global state issues under multiple workers.
+    return ProviderBalancer(strategy=settings.balance_strategy)
 
 
 def verify_auth(
@@ -97,12 +100,15 @@ def resolve_model(requested: str, settings: Settings) -> str:
 
 def _is_rate_limit_error(exc: Exception) -> bool:
     msg = str(exc).lower()
-    return any(x in msg for x in ("429", "rate limit", "rate_limit", "too many requests", "quota", "resource_exhausted"))
+    return any(
+        x in msg
+        for x in ("429", "rate limit", "rate_limit", "too many requests", "quota", "resource_exhausted")
+    )
 
 
 def _log_request(
-    db: Session,
-    api_key: Optional[ApiKey],
+    api_key_id: int | None,
+    user_id: int | None,
     provider: str,
     model: str,
     success: bool,
@@ -112,22 +118,30 @@ def _log_request(
     latency_ms: float | None = None,
     error: str | None = None,
 ) -> float:
+    """Log request using a fresh short-lived session (safe for streaming)."""
     cost = calc_cost_usd(model, input_tokens, output_tokens) if success else 0.0
-    log = RequestLog(
-        user_id=api_key.user_id if api_key else None,
-        api_key_id=api_key.id if api_key else None,
-        provider=provider,
-        model=model,
-        success=success,
-        is_stream=is_stream,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cost_usd=cost,
-        latency_ms=latency_ms,
-        error_message=error[:500] if error else None,
-    )
-    db.add(log)
-    db.commit()
+    db = SessionLocal()
+    try:
+        log = RequestLog(
+            user_id=user_id,
+            api_key_id=api_key_id,
+            provider=provider,
+            model=model,
+            success=success,
+            is_stream=is_stream,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost,
+            latency_ms=latency_ms,
+            error_message=error[:500] if error else None,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log request: {e}")
+        db.rollback()
+    finally:
+        db.close()
     return cost
 
 
@@ -143,7 +157,7 @@ async def get_stats(
 ):
     mem = stats.get_snapshot()
     total_db = db.query(RequestLog).count()
-    success_db = db.query(RequestLog).filter(RequestLog.success == True).count()  # noqa: E712
+    success_db = db.query(RequestLog).filter(RequestLog.success.is_(True)).count()
     total_cost = db.query(func.coalesce(func.sum(RequestLog.cost_usd), 0.0)).scalar() or 0.0
     total_in = db.query(func.coalesce(func.sum(RequestLog.input_tokens), 0)).scalar() or 0
     total_out = db.query(func.coalesce(func.sum(RequestLog.output_tokens), 0)).scalar() or 0
@@ -190,7 +204,7 @@ async def create_message(
     try:
         anth_req = AnthropicRequest(**body)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid request: {e}") from e
 
     budget_err = check_budget(db, api_key)
     if budget_err:
@@ -207,6 +221,8 @@ async def create_message(
 
     last_error: Exception | None = None
     start_ts = time.time()
+    api_key_id = api_key.id if api_key else None
+    user_id = api_key.user_id if api_key else None
 
     for ref in ordered:
         provider_name, model_id = parse_model_ref(ref)
@@ -219,6 +235,7 @@ async def create_message(
         try:
             logger.info(f"Routing -> {provider_name}/{model_id} (stream={anth_req.stream})")
             if anth_req.stream:
+
                 async def stream_and_log():
                     in_tok, out_tok = 0, 0
                     try:
@@ -237,8 +254,15 @@ async def create_message(
                     finally:
                         stats.record_success(provider_name, in_tok, out_tok)
                         _log_request(
-                            db, api_key, provider_name, model_id, True, True,
-                            in_tok, out_tok, (time.time() - start_ts) * 1000,
+                            api_key_id,
+                            user_id,
+                            provider_name,
+                            model_id,
+                            True,
+                            True,
+                            in_tok,
+                            out_tok,
+                            (time.time() - start_ts) * 1000,
                         )
 
                 return StreamingResponse(
@@ -253,21 +277,37 @@ async def create_message(
                 out_tok = usage.get("output_tokens", 0)
                 stats.record_success(provider_name, in_tok, out_tok)
                 _log_request(
-                    db, api_key, provider_name, model_id, True, False,
-                    in_tok, out_tok, (time.time() - start_ts) * 1000,
+                    api_key_id,
+                    user_id,
+                    provider_name,
+                    model_id,
+                    True,
+                    False,
+                    in_tok,
+                    out_tok,
+                    (time.time() - start_ts) * 1000,
                 )
                 return JSONResponse(content=result)
         except Exception as e:
             is_rl = _is_rate_limit_error(e)
             stats.record_failure(provider_name, str(e), is_rate_limit=is_rl)
             _log_request(
-                db, api_key, provider_name, model_id, False, anth_req.stream,
-                error=str(e), latency_ms=(time.time() - start_ts) * 1000,
+                api_key_id,
+                user_id,
+                provider_name,
+                model_id,
+                False,
+                anth_req.stream,
+                error=str(e),
+                latency_ms=(time.time() - start_ts) * 1000,
             )
             last_error = e
             continue
 
-    raise HTTPException(status_code=502, detail=f"All providers failed. Last error: {last_error}")
+    raise HTTPException(
+        status_code=502,
+        detail=f"All providers failed. Last error: {last_error}",
+    )
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -345,4 +385,11 @@ loadKeys();
 
 @app.get("/")
 async def root():
-    return {"name": "Free Claude Gateway", "version": __version__, "docs": "/docs", "admin": "/admin", "stats": "/stats", "health": "/health"}
+    return {
+        "name": "Free Claude Gateway",
+        "version": __version__,
+        "docs": "/docs",
+        "admin": "/admin",
+        "stats": "/stats",
+        "health": "/health",
+    }
