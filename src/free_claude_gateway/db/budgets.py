@@ -33,7 +33,7 @@ def get_key_usage(session: Session, api_key_id: int) -> dict:
         ).where(
             RequestLog.api_key_id == api_key_id,
             RequestLog.created_at >= day,
-            RequestLog.success == True,  # noqa: E712
+            RequestLog.success.is_(True),
         )
     ).one()
 
@@ -43,7 +43,7 @@ def get_key_usage(session: Session, api_key_id: int) -> dict:
         ).where(
             RequestLog.api_key_id == api_key_id,
             RequestLog.created_at >= month,
-            RequestLog.success == True,  # noqa: E712
+            RequestLog.success.is_(True),
         )
     ).one()
 
